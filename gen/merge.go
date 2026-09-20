@@ -1,14 +1,12 @@
 package gen
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,59 +14,166 @@ import (
 	"strings"
 )
 
-// I tried to do this the "right" way using go/parser but ran into various strange behavior;
-// I probably just am missing something with how to use it properly.  Regardless, doing this
-// the hacky way should serve us just as well for now.
+// mergeGoFiles combines Go source files into one using go/parser (AST-based).
+// dir is the directory containing the files, out and in are file names within dir.
+//
+// The input files are processed in sorted-by-name order so the output is
+// deterministic across platforms; in particular, top-level declarations
+// (including init functions) appear in the output in that same order, so
+// init execution order is predictable.
+//
+// Imports from all files are merged into a single import block:
+//   - exact duplicates (same name and path) are removed;
+//   - the same path imported under different explicit names is unified to the
+//     first name seen, and references to the dropped names are rewritten;
+//   - the same explicit name used for different paths is disambiguated by
+//     renaming the later import (name2, name3, ...) and rewriting its references;
+//   - unnamed, blank (_) and dot (.) imports are kept as-is (only exact
+//     duplicates are removed) since their package names cannot be known
+//     without type information.
 func mergeGoFiles(dir, out string, in ...string) error {
 
-	var pkgClause string
-	var importBlocks []string
-	var otherBlocks []string
-
-	sort.Strings(in) // try to get deterministic output
-
-	// read and split each go file
-	for _, fname := range in {
-		fpath := filepath.Join(dir, fname)
-		pkgPart, importPart, rest, err := readAndSplitGoFile(fpath)
-		if err != nil {
-			return fmt.Errorf("error trying to read and split Go file: %w", err)
-		}
-
-		if pkgClause == "" {
-			pkgClause = pkgPart
-		}
-
-		importBlocks = append(importBlocks, importPart)
-		otherBlocks = append(otherBlocks, rest)
+	if len(in) == 0 {
+		return fmt.Errorf("mergeGoFiles: no input files")
 	}
 
-	var newPgm bytes.Buffer
+	sort.Strings(in) // deterministic output and init execution order
 
-	// use the package part from the first one
-	newPgm.WriteString(pkgClause)
-	newPgm.WriteString("\n\n")
-
-	// concat the imports
-	for _, bl := range importBlocks {
-		newPgm.WriteString(bl)
-		newPgm.WriteString("\n\n")
-	}
-
-	// concat the rest
-	for _, bl := range otherBlocks {
-		newPgm.WriteString(bl)
-		newPgm.WriteString("\n\n")
-	}
-
-	// now read it back in using the parser and see if it will help us clean up the imports
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, out, newPgm.String(), parser.ParseComments)
+
+	// parse all the files
+	files := make([]*ast.File, 0, len(in))
+	for _, fname := range in {
+		f, err := parser.ParseFile(fset, filepath.Join(dir, fname), nil, parser.ParseComments)
+		if err != nil {
+			return fmt.Errorf("error trying to parse Go file %q: %w", fname, err)
+		}
+		files = append(files, f)
+	}
+
+	pkgName := files[0].Name.Name
+
+	// merge state for imports
+	type mergedImport struct {
+		name string // local name: "", "_", "." or a regular identifier
+		path string // quoted import path
+	}
+	pathToName := make(map[string]string) // import path -> canonical local name ("" if unnamed)
+	nameToPath := make(map[string]string) // explicit local name -> import path
+	var imports []mergedImport            // canonical imports, in first-seen order
+
+	// bodyDecls[i] holds the non-import declarations of files[i]
+	bodyDecls := make([][]ast.Decl, len(files))
+
+	for i, f := range files {
+
+		if f.Name.Name != pkgName {
+			return fmt.Errorf("package name mismatch: %q is package %q but %q is package %q",
+				in[0], pkgName, in[i], f.Name.Name)
+		}
+
+		// compute import renames needed for this file and collect canonical imports
+		renames := make(map[string]string)
+		for _, imp := range f.Imports {
+			path := imp.Path.Value
+			name := ""
+			if imp.Name != nil {
+				name = imp.Name.Name
+			}
+
+			canonicalName, seen := pathToName[path]
+			if seen {
+				switch {
+				case canonicalName == name:
+					continue // exact duplicate, drop it
+				case isPlainImportName(canonicalName) && isPlainImportName(name):
+					// same path under two different explicit names: unify to the
+					// first one and rewrite references below
+					renames[name] = canonicalName
+					continue
+				default:
+					// one of them is unnamed, blank or dot: cannot safely unify
+					// without package type information, keep both (legal Go)
+					imports = append(imports, mergedImport{name: name, path: path})
+					continue
+				}
+			}
+
+			// first time seeing this path
+			if isPlainImportName(name) {
+				if otherPath, ok := nameToPath[name]; ok && otherPath != path {
+					// same import name used for a different path: rename this one
+					newName := uniqueImportName(name, nameToPath)
+					renames[name] = newName
+					name = newName
+				}
+				nameToPath[name] = path
+			}
+			pathToName[path] = name
+			imports = append(imports, mergedImport{name: name, path: path})
+		}
+
+		// go through the declarations, dropping import decls and applying renames
+		for _, decl := range f.Decls {
+			if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
+				continue
+			}
+			if len(renames) > 0 {
+				applyImportRenames(decl, renames)
+			}
+			bodyDecls[i] = append(bodyDecls[i], decl)
+		}
+	}
+
+	// print the merged program: package clause, one import block, then each
+	// file's declarations (printed per file so comments keep their positions
+	// relative to their own declarations)
+	var newPgm bytes.Buffer
+	newPgm.WriteString("package " + pkgName + "\n\n")
+
+	if len(imports) > 0 {
+		specs := make([]ast.Spec, len(imports))
+		for i, imp := range imports {
+			spec := &ast.ImportSpec{Path: &ast.BasicLit{Kind: token.STRING, Value: imp.path}}
+			if imp.name != "" {
+				spec.Name = ast.NewIdent(imp.name)
+			}
+			specs[i] = spec
+		}
+		importDecl := &ast.GenDecl{Tok: token.IMPORT, Specs: specs}
+		err := printer.Fprint(&newPgm, token.NewFileSet(), importDecl)
+		if err != nil {
+			return fmt.Errorf("error trying to print merged imports: %w", err)
+		}
+		newPgm.WriteString("\n\n")
+	}
+
+	for i, f := range files {
+		// print as a synthetic file (keeps comments positioned correctly
+		// relative to their own declarations), then drop the package clause
+		chunkFile := &ast.File{
+			Package:  f.Package,
+			Name:     f.Name,
+			Decls:    bodyDecls[i],
+			Comments: f.Comments,
+		}
+		var chunk bytes.Buffer
+		err := printer.Fprint(&chunk, fset, chunkFile)
+		if err != nil {
+			return fmt.Errorf("error trying to print declarations from %q: %w", in[i], err)
+		}
+		newPgm.WriteString(dropPackageClause(chunk.String(), f.Name.Name))
+		newPgm.WriteString("\n")
+	}
+
+	// now read it back in so positions are normalized, then clean up the imports
+	fset2 := token.NewFileSet()
+	f, err := parser.ParseFile(fset2, out, newPgm.String(), parser.ParseComments)
 	if err != nil {
 		log.Printf("DEBUG: full merged file contents:\n%s", newPgm.String())
 		return fmt.Errorf("error trying to parse merged file: %w", err)
 	}
-	ast.SortImports(fset, f)
+	ast.SortImports(fset2, f)
 
 	dedupAstFileImports(f)
 
@@ -77,7 +182,7 @@ func mergeGoFiles(dir, out string, in ...string) error {
 		return fmt.Errorf("error trying to open output file: %w", err)
 	}
 	defer fileout.Close()
-	err = printer.Fprint(fileout, fset, f)
+	err = printer.Fprint(fileout, fset2, f)
 	if err != nil {
 		return err
 	}
@@ -85,189 +190,53 @@ func mergeGoFiles(dir, out string, in ...string) error {
 
 }
 
-func readAndSplitGoFile(fpath string) (pkgPart, importPart, rest string, reterr error) {
-
-	// NOTE: this is not perfect, it's only meant to be good enough to correctly parse the files
-	// we generate, not any general .go file
-	// (it does not understand multi-line comments, for example)
-
-	var fullInput bytes.Buffer
-	// defer func() {
-	// log.Printf("readAndSplitGoFile(%q) full input:\n%s\n\nPKG:\n%s\n\nIMPORT:\n%s\n\nREST:\n%s\n\nErr:%v",
-	// 	fpath,
-	// 	fullInput.Bytes(),
-	// 	pkgPart,
-	// 	importPart,
-	// 	rest,
-	// 	reterr)
-	// }()
-
-	var pkgBuf, importBuf, restBuf bytes.Buffer
-	var commentBuf bytes.Buffer
-
-	const (
-		inPkg = iota
-		inImport
-		inRest
-	)
-	state := inPkg
-
-	f, err := os.Open(fpath)
-	if err != nil {
-		reterr = err
-		return
-	}
-	defer f.Close()
-	br := bufio.NewReader(f)
-	i := 0
-loop:
-	for {
-		i++
-		line, err := br.ReadString('\n')
-		if err == io.EOF {
-			if len(line) == 0 {
-				break
-			}
-		} else if err != nil {
-			reterr = err
-			return
-		}
-		fullInput.WriteString(line)
-
-		lineFields := strings.Fields(line)
-		var first string
-		if len(lineFields) > 0 {
-			first = lineFields[0]
-		}
-
-		_ = i
-		// log.Printf("%s: iteration %d; lineFields=%#v", fpath, i, lineFields)
-
-		switch state {
-
-		case inPkg: // in package block, haven't see the package line yet
-			pkgBuf.WriteString(line)
-			if first == "package" {
-				state = inImport
-			}
-			continue loop
-
-		case inImport: // after package and are still getting what look like imports
-
-			// hack to move line comments below the import area into the rest section - since
-			// while we're going through there we can't know if there will be more imports or not
-			if strings.HasPrefix(first, "//") {
-				commentBuf.WriteString(line)
-				continue loop
-			}
-
-			switch first {
-			case "type", "func", "var":
-				state = inRest
-
-				restBuf.Write(commentBuf.Bytes())
-				commentBuf.Reset()
-
-				restBuf.WriteString(line)
-				continue loop
-			}
-
-			importBuf.Write(commentBuf.Bytes())
-			commentBuf.Reset()
-
-			importBuf.WriteString(line)
-			continue loop
-
-			// // things we assume are part of the import block:
-			// switch {
-			// case strings.TrimSpace(first) == "": // blank line
-			// case strings.HasPrefix(first, "//"): // line comment
-			// case strings.HasPrefix(first, "import"): // import statement
-			// case strings.HasPrefix(first, `"`): // should be a multi-line import package name
-			// }
-
-		case inRest:
-			restBuf.WriteString(line)
-			continue loop
-
-		default:
-		}
-
-		panic("unreachable")
-
-	}
-
-	pkgPart = pkgBuf.String()
-	importPart = importBuf.String()
-	rest = restBuf.String()
-	return
+// isPlainImportName reports whether name is a regular import identifier,
+// i.e. not unnamed (""), blank ("_") or dot (".").
+func isPlainImportName(name string) bool {
+	return name != "" && name != "_" && name != "."
 }
 
-// // mergeGoFiles combines go source files into one.
-// // dir is the package path, out and in are file names (no slashes, same directory).
-// func mergeGoFiles(dir, out string, in ...string) error {
+// uniqueImportName returns name, name2, name3, ... whichever is not already
+// present in nameToPath.
+func uniqueImportName(name string, nameToPath map[string]string) string {
+	if _, ok := nameToPath[name]; !ok {
+		return name
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s%d", name, i)
+		if _, ok := nameToPath[candidate]; !ok {
+			return candidate
+		}
+	}
+}
 
-// 	pkgName := goGuessPkgName(dir)
+// applyImportRenames rewrites package qualifier identifiers in decl according
+// to renames (old import name -> new import name).
+func applyImportRenames(decl ast.Decl, renames map[string]string) {
+	ast.Inspect(decl, func(n ast.Node) bool {
+		selExpr, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		ident, ok := selExpr.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if newName, ok := renames[ident.Name]; ok {
+			ident.Name = newName
+		}
+		return true
+	})
+}
 
-// 	fset := token.NewFileSet()
-// 	files := make(map[string]*ast.File)
-
-// 	// parse all the files
-// 	for _, name := range in {
-
-// 		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.ParseComments)
-// 		if err != nil {
-// 			return fmt.Errorf("error reading file %q: %w", name, err)
-// 		}
-// 		files[name] = f
-// 	}
-
-// 	pkg := &ast.Package{Name: pkgName, Files: files}
-// 	fout := ast.MergePackageFiles(pkg,
-// 		ast.FilterImportDuplicates, // this doesn't seem to be doing anything... sigh
-// 	)
-
-// 	// ast.SortImports(fset, fout)
-// 	// ast.Print(fset, fout.Decls)
-// 	moveImportsToTop(fout)
-
-// 	dedupAstFileImports(fout)
-
-// 	var buf bytes.Buffer
-// 	printer.Fprint(&buf, fset, fout)
-
-// 	return os.WriteFile(filepath.Join(dir, out), buf.Bytes(), 0644)
-// }
-
-// func moveImportsToTop(f *ast.File) {
-
-// 	var idecl []ast.Decl // import decls
-// 	var odecl []ast.Decl // other decls
-
-// 	// go through every declaration and move any imports into a separate list
-// 	for _, decl := range f.Decls {
-
-// 		{
-// 			// import must be genDecl
-// 			genDecl, ok := decl.(*ast.GenDecl)
-// 			if !ok {
-// 				goto notImport
-// 			}
-
-// 			// with token "import"
-// 			if genDecl.Tok != token.IMPORT {
-// 				goto notImport
-// 			}
-
-// 			idecl = append(idecl, decl)
-// 			continue
-// 		}
-
-// 	notImport:
-// 		odecl = append(odecl, decl)
-// 		continue
-// 	}
-
-// 	// new decl list imports plus everything else
-// 	f.Decls = append(idecl, odecl...)
-// }
+// dropPackageClause removes the "package <name>" line from printed Go source.
+func dropPackageClause(src, pkgName string) string {
+	pkgLine := "package " + pkgName
+	lines := strings.Split(src, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) == pkgLine {
+			return strings.Join(append(lines[:i], lines[i+1:]...), "\n")
+		}
+	}
+	return src
+}
